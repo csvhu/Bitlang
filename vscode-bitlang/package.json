@@ -1,0 +1,30 @@
+{
+  "name": "vscode-bitlang",
+  "displayName": "BitLang",
+  "description": "Syntax highlighting for the BitLang esoteric programming language",
+  "version": "0.1.0",
+  "publisher": "csvhu",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/csvhu/Bitlang"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "bitlang",
+        "aliases": ["BitLang", "bitlang"],
+        "extensions": [".bitlang"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "bitlang",
+        "scopeName": "source.bitlang",
+        "path": "./syntaxes/bitlang.tmLanguage.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,125 @@
+{
+  "name": "BitLang",
+  "scopeName": "source.bitlang",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#prog_end" },
+    { "include": "#terminators" },
+    { "include": "#string_literal" },
+    { "include": "#hex_literal" },
+    { "include": "#char_literal" },
+    { "include": "#file_jump" },
+    { "include": "#exec" },
+    { "include": "#selection" },
+    { "include": "#commands" },
+    { "include": "#forge" },
+    { "include": "#control_flow" },
+    { "include": "#bit_ops" },
+    { "include": "#navigation" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.bitlang",
+      "match": "#.*$"
+    },
+    "prog_end": {
+      "name": "keyword.control.end.bitlang",
+      "match": "!%!(\\.?)?"
+    },
+    "terminators": {
+      "patterns": [
+        { "name": "keyword.control.block-end.bitlang", "match": "%%" },
+        { "name": "keyword.control.line-end.bitlang",  "match": "(?<!!)%" }
+      ]
+    },
+    "string_literal": {
+      "name": "string.quoted.double.bitlang",
+      "begin": "!\"",
+      "end": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.bitlang" } },
+      "endCaptures":   { "0": { "name": "punctuation.definition.string.end.bitlang" } },
+      "patterns": [
+        {
+          "name": "constant.character.escape.bitlang",
+          "match": "\\\\([ntr0\\\\\"x][0-9a-fA-F]{0,2})"
+        }
+      ]
+    },
+    "hex_literal": {
+      "name": "constant.numeric.hex.bitlang",
+      "match": "!#[0-9a-fA-F]{2}"
+    },
+    "char_literal": {
+      "name": "constant.character.bitlang",
+      "match": "!'(\\\\[ntr0\\\\]|[^'])'"
+    },
+    "file_jump": {
+      "name": "meta.file-jump.bitlang",
+      "match": "(%//)([^\\n%]+)",
+      "captures": {
+        "1": { "name": "keyword.control.file-jump.bitlang" },
+        "2": { "name": "string.unquoted.path.bitlang" }
+      }
+    },
+    "exec": {
+      "patterns": [
+        { "name": "keyword.other.exec.capture.bitlang", "match": "!X->[@?!]\\d*" },
+        { "name": "keyword.other.exec.bitlang",         "match": "!X" }
+      ]
+    },
+    "selection": {
+      "patterns": [
+        {
+          "name": "meta.selection.bitlang",
+          "match": "!(\\[)(M:@|\\d+(?::\\+?\\d+)?)(\\])",
+          "captures": {
+            "1": { "name": "punctuation.section.selection.begin.bitlang" },
+            "2": { "name": "constant.numeric.selection.bitlang" },
+            "3": { "name": "punctuation.section.selection.end.bitlang" }
+          }
+        },
+        { "name": "keyword.other.mark.bitlang", "match": "!M" }
+      ]
+    },
+    "commands": {
+      "patterns": [
+        { "name": "support.function.io.bitlang",      "match": "![OIEILW](?:\\[[^\\]]*\\])?" },
+        { "name": "support.function.load.bitlang",    "match": "!L(?:\\[[^\\]]*\\])?" },
+        { "name": "support.function.env.bitlang",     "match": "!\\$[A-Za-z_][A-Za-z0-9_]*(?:<-\\[\\d+:\\d+\\])?" },
+        { "name": "support.function.self.bitlang",    "match": "!~" },
+        { "name": "support.function.eval.bitlang",    "match": "!\\^(?:\\[[^\\]]*\\])?" },
+        { "name": "keyword.control.jump.bitlang",     "match": "!@\\d+" },
+        { "name": "keyword.control.jump.bitlang",     "match": "![+\\-]@?\\d+" },
+        { "name": "keyword.control.nav.bitlang",      "match": "![<>]" },
+        { "name": "keyword.control.count-loop.bitlang","match": "!\\d+(?=\\s*\\[)" }
+      ]
+    },
+    "forge": {
+      "patterns": [
+        { "name": "keyword.control.forge.open.bitlang",  "match": "\\$(?!!)" },
+        { "name": "keyword.control.forge.sep.bitlang",   "match": "\\|" },
+        { "name": "keyword.control.forge.close.bitlang", "match": "\\$!" }
+      ]
+    },
+    "control_flow": {
+      "patterns": [
+        { "name": "keyword.control.if.bitlang",    "match": "!!" },
+        { "name": "keyword.control.block.bitlang", "match": "[{}]!?" },
+        { "name": "keyword.control.while.bitlang", "match": "[\\[\\]]" }
+      ]
+    },
+    "bit_ops": {
+      "patterns": [
+        { "name": "keyword.operator.set.bitlang",   "match": "\\+" },
+        { "name": "keyword.operator.clear.bitlang", "match": "-" },
+        { "name": "keyword.operator.flip.bitlang",  "match": "=" }
+      ]
+    },
+    "navigation": {
+      "patterns": [
+        { "name": "keyword.operator.nav.bitlang", "match": "<" },
+        { "name": "keyword.operator.nav.bitlang", "match": ">" }
+      ]
+    }
+  }
+}
