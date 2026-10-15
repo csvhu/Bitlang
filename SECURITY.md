@@ -2,8 +2,12 @@
 
 ## Status
 
-BitLang is an **experimental esolang interpreter**. It has not been security-hardened or
-robustness-tested. It is a learning tool and reference implementation — not a secure runtime.
+BitLang is an **experimental esolang interpreter**. It is a learning tool and reference
+implementation — not a secure runtime.
+
+The v4 interpreter has been compiled with AddressSanitizer and UBSan and run against a set
+of regression scripts covering every fixed bug below. It has not been fuzzed, formally
+audited, or hardened against hostile input.
 
 **Do not run untrusted `.bitlang` scripts.** Do not expose the interpreter to untrusted input
 in any automated or networked context.
@@ -16,72 +20,109 @@ BitLang's design gives scripts broad, intentional access to the host system. The
 features are inherently dangerous and exist by design:
 
 ### Shell Execution (`!X`)
-The `!X` instruction reads the active tape selection as a string and passes it directly to
-`system()` or `popen()`, which invokes `/bin/sh -c`. There is no sanitization, escaping, or
-sandboxing. Any `.bitlang` script can execute arbitrary shell commands with the privileges of
-the interpreter process.
+`!X` reads the active tape selection (up to the first null byte) as a string and passes it
+directly to `system()` or `popen()`, which invokes `/bin/sh -c`. There is no sanitization,
+escaping, or sandboxing. Any `.bitlang` script can execute arbitrary shell commands with the
+privileges of the interpreter process.
+
+With `!X->!`, the interpreter reads all of its own stdin, writes it to a temporary file in
+`/tmp` (created with `mkstemp`, mode 0600), and runs the command with that file as input.
+The file is deleted afterwards, but is left behind if the interpreter is killed mid-run.
 
 ### Environment Variable Access (`!$VAR`, `!$VAR<-[n:m]`)
-Scripts can read any environment variable into the tape (`!$VAR`) or write tape content back
-into the process environment (`!$VAR<-[n:m]`). This includes sensitive variables such as
-`PATH`, `HOME`, `LD_PRELOAD`, API keys, or session tokens present in the environment at
-launch time.
+Scripts can read any environment variable into the tape or write tape content into the
+process environment. This includes sensitive variables such as `PATH`, `HOME`,
+`LD_PRELOAD`, API keys, or session tokens present at launch, and it affects every command
+started afterwards by `!X`.
 
-### File I/O (`!L`, `!W`)
-Scripts can read any file accessible to the interpreter process (`!L[path]`) and write tape
-content to any writable path (`!W[path]`). Paths are not validated or restricted.
+### File I/O (`!L`, `!W`, `!O[path]`, `!I[path]`)
+Scripts can read any file accessible to the interpreter process and write to any writable
+path. Paths are not validated or restricted. `!W[path]` **truncates** the target file;
+`!O[path]` **appends** to it.
 
 ### Dynamic Evaluation (`!^`)
-The `!^[n:m]` instruction reads bytes from the tape and evaluates them as BitLang source code
-at runtime. Combined with `!X` or `!$VAR`, this enables scripts to construct and execute
-arbitrary code dynamically.
+`!^` reads bytes from the tape and runs them as BitLang source. Combined with `!X` or
+`!$VAR`, scripts can construct and execute arbitrary code at runtime. A lexer error in
+evaluated text terminates the whole interpreter.
 
 ### File Jumps (`%//`)
-Scripts can hand off execution to another `.bitlang` file on disk. The interpreter enforces
-the `.bitlang` extension but does not restrict the path in any other way.
+Scripts can hand off execution to another `.bitlang` file. The interpreter enforces the
+`.bitlang` extension but does not restrict the path in any other way. Relative paths are
+resolved against the current working directory, not the calling script's directory.
+
+### Resource Exhaustion
+There is no overall memory, CPU, or time limit. A script can loop forever, grow the tape
+until memory runs out, or start processes with `!X`. The per-operation limits listed below
+only stop single runaway operations.
 
 ---
 
 ## Fixed Implementation Vulnerabilities
 
-The following bugs identified in earlier versions of the interpreter have been corrected.
+### Fixed in v3
 
-**Unsigned underflow in `sel_resolve` (SEL_REL)** *(fixed)*
-`![n:+0]` now produces a hard error instead of wrapping `end` to `UINT64_MAX`.
+- **Unsigned underflow in `sel_resolve` (`SEL_REL`)** — `![n:+0]` is a hard error.
+- **Unchecked `malloc`/`calloc`/`realloc`** — all allocations check for NULL and exit with a
+  diagnostic.
+- **Race in `tape_flip_bit` under Forge** — the read-modify-write happens under one lock.
+- **Integer overflow in `read_number`** — literals are parsed into `uint64_t` with overflow
+  detection (see the v4 note below: the limit chosen in v3 was too high).
+- **Unchecked `write()` in `EXEC_PIPE_IN`** — the full buffer is written in a loop.
 
-**Unchecked `malloc`/`calloc`/`realloc` return values** *(fixed)*
-All heap allocations — `tape_chunk`, `sel_read_bytes`, `parse_string_literal`, `ts_init`,
-`ts_push`, `read_path_arg`, `read_filejump_path`, `read_env_name`, and the `EXEC_PIPE_IN`
-stdin buffer — now check for NULL and exit with a diagnostic on allocation failure.
+### Fixed in v4
 
-**TOCTOU race in `tape_flip_bit` under Forge** *(fixed)*
-`tape_flip_bit` now performs the read-modify-write as a single atomic operation under one
-mutex acquisition (XOR on the byte), eliminating the lost-update window.
-
-**Integer overflow in `read_number`** *(fixed)*
-Numeric literals are now parsed into `uint64_t` with explicit overflow detection. Literals
-exceeding the interpreter's safe limit (`9 × 10¹⁸`) are rejected with an error.
-
-**Unchecked `write()` in `EXEC_PIPE_IN`** *(fixed)*
-The full stdin buffer is now written in a loop with proper `ssize_t` tracking.
+- **Endless loop on stray closers** — a top-level `]`, `}`, `|` or `$!` made the interpreter
+  spin at 100% CPU. It is now an `unmatched` error.
+- **Address wraparound** — v3 accepted numbers up to 9 × 10^18, but byte indices are
+  multiplied by 8, so anything above 2^61 wrapped around the 64-bit bit address space
+  (`!@2305843009213693952` jumped to bit 0). The limit is now 2^61 − 1, and every head move
+  is checked, so the head can no longer wrap past either end of the tape.
+- **Huge allocation abort in `!^`** — `!^[5]` and reversed ranges like `[5:2]` underflowed
+  the length calculation and tried to allocate about 2^64 bytes. Ranges are now ordered
+  and validated, and any selection read into memory (`!X`, `!$VAR<-`, `!^`) is capped at
+  256 MiB with a clean error instead of a crash.
+- **Unbounded recursion through `%//`** — a script that jumped to itself overflowed the stack
+  and segfaulted. File jumps now share the 64-level nesting limit with `!^`.
+- **Input loss in `!I`** — a full selection consumed one extra input byte. Fixed.
+- **Hex parsing** — `!#F` swallowed the next character and `"\x4"` swallowed the closing
+  quote. Hex escapes now take one or two hex digits only, and invalid hex is an error.
+- **Silent truncation and parse leniency** — more than 64 Forge segments, unterminated
+  strings, and unterminated `[path` arguments are now errors instead of being ignored.
+- **Unchecked `pthread_create`** — a failed thread start led to joining a thread that never
+  existed. The segment now runs inline with a warning.
+- **Script loading** — `load_file` now works on pipes, checks read errors, closes the file on
+  every path, and is capped at 256 MiB.
+- **Read allocation** — reading never-written tape no longer allocates memory.
 
 ---
 
 ## Remaining Known Limits and Behaviour
 
-**`!L` file size limit**
-File loads via `!L` are now capped at 256 MiB (`MAX_LOAD_BYTES`). Loads exceeding this
-limit are aborted with an error message. The cap is a compile-time constant and can be
-adjusted, but should not be removed without adding an explicit resource policy.
+**Per-operation size limits**
+`!L` loads are capped at 256 MiB per call, selections read into memory are capped at
+256 MiB, and script files are capped at 256 MiB. These are compile-time constants. There is
+no cap on the total size of the tape, on stream-mode `!I`, or on `!X->@n` output, which are
+bounded only by available memory and tape address space.
 
-**`!^` recursion depth limit**
-`!^` (eval) is now limited to `MAX_EVAL_DEPTH` (64) levels of nesting. Exceeding this
-prints an error and returns without executing the inner eval. Stack exhaustion via deeply
-recursive `!^` chains is no longer possible within the default limit.
+**Nesting limit**
+`!^` and `%//` share a nesting limit of 64 levels. Exceeding it prints an error and skips
+that eval or jump. Breadth is not limited: a script can still run unbounded work at each
+level.
 
-**`MAX_FORGE_LINES` silent truncation**
-Forge blocks with more than 64 `|`-separated lines silently truncate. This is a known
-design-level cap that has not been changed; excess lines are ignored without warning.
+**Forge concurrency**
+The tape lock is per tape, and each single-bit or single-byte read or write is atomic.
+Operations that touch many bytes (string literals, selection I/O, `!L`, `!X->@n`) are not
+atomic as a whole, so Forge segments writing overlapping regions can interleave. Head and
+selection state are per segment. `setenv` and `getenv` are not synchronised, so environment
+operations from several Forge segments can race.
+
+**Error handling**
+Fatal errors call `exit(1)` immediately, including from inside evaluated text or a Forge
+thread. Non-fatal errors (for example `!X` without a selection) print a message and skip that
+one operation. SPEC.md lists which is which.
+
+**Selections cannot be cleared**
+Once a selection is set it stays active until replaced by another one.
 
 ---
 
@@ -94,10 +135,11 @@ undefined behaviour through otherwise valid-looking scripts.
 
 Some areas still worth exploring:
 
-- Parser edge cases: malformed `!X->@`, `![M:@]` without prior `!M`, deeply nested Forge
-  blocks hitting the `MAX_FORGE_LINES` (64) silent truncation cap
-- Forge concurrency: the tape mutex is per-tape, but head and selection state are per-thread;
-  races beyond `tape_flip_bit` may still exist in other multi-byte operations under Forge
+- Parser edge cases: `}!` consumes a following `!`, so `}!>` lexes as bit-right; `!X->` is
+  always read as a capture suffix; malformed `!X->@`; `![M:@]` without a prior `!M`
+- Forge concurrency: multi-byte operations and environment access under Forge
+- Evaluated text: lexer errors and deeply nested `!^` and `%//` chains
+- Very large captures and loads near the size limits
 
 ---
 
@@ -118,8 +160,8 @@ already planned. Asking first saves both of us time.
 3. Keep the fix minimal and scoped — one issue per PR. Don't refactor surrounding code unless
    it's directly necessary for the fix.
 
-Fixes that are likely to be accepted: NULL checks, the `SEL_REL` underflow guard, the
-`tape_flip_bit` atomic rewrite, overflow detection in `read_number`, Forge truncation warning.
+Fixes that are likely to be accepted: missing error checks, overflow and bounds guards, and
+other fixes that do not change what a valid script does.
 
 Fixes that need more discussion first: anything touching the language semantics, the tape
 architecture, the Forge threading model, or `!^` eval behaviour.
