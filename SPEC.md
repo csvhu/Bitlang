@@ -1,4 +1,4 @@
-# BitLang v3 Language Specification
+# BitLang v4 Language Specification
 
 ## Overview and Philosophy
 
@@ -9,6 +9,25 @@ upon the tape and is then discarded — the tape carries forward whatever was wr
 File jumps (`%//`) are state handoffs between scripts, not subroutine calls. Selections
 target tape regions precisely without disturbing others. `!^` (eval) allows the tape to
 contain its own next transformation instructions — data and program are unified in the tape.
+
+This document describes the v4 language and its reference interpreter (`bitlang-v4.c`). The
+syntax is the same as v3; the differences are listed under "Changes from v3".
+
+---
+
+## Source Format
+
+- Whitespace (including newlines) separates tokens and is otherwise ignored.
+- A **line** ends at `%` (or `%%`), not at a newline. A script with no `%` is a single line.
+- `#` at the start of a token begins a comment that runs to the end of the physical line.
+  `#` inside a string or literal is not a comment, and `!#` is the hex literal prefix.
+- `!%!` (optionally `!%!.`) ends the program. Nothing after it is read or lexed.
+
+| Token | Meaning |
+|-------|---------|
+| `%` | Line end |
+| `%%` | Block end (behaves like `%`) |
+| `!%!` | Program end; stops execution |
 
 ---
 
@@ -21,8 +40,8 @@ bit 0 is the most significant bit of byte 0. Bytes are 8 contiguous bits in big-
 order (most significant bit first).
 
 The interpreter stores the tape as a chunked, mutex-protected hash map. Only chunks that
-have been written to are allocated. The tape is effectively infinite within the addressable
-range of a `uint64_t` bit index.
+have been written to are allocated; reading never-written tape returns zeros without
+allocating. The largest addressable byte index is 2^61 − 1 (2305843009213693951).
 
 ### Head
 
@@ -33,10 +52,17 @@ divide by 8.
 When a command takes a byte index argument (e.g. `!@n`, selection indices), that argument
 is a byte index. The conversion is `bit_index = byte_index x 8`.
 
+Moving the head before bit 0, or past the end of the addressable tape, is a fatal error.
+
+### Numbers
+
+Numeric arguments are unsigned decimal integers. Values above 2^61 − 1 are rejected at parse
+time with an error.
+
 ### Concurrency
 
-The tape mutex is per-tape and all reads and writes are thread-safe. Head and selection
-state are per-thread under Forge. See the Forge section for concurrency semantics.
+The tape mutex is per-tape. Each single-bit operation and each single-byte read or write is
+atomic. Head and selection state are per-thread under Forge. See the Forge section.
 
 ---
 
@@ -64,12 +90,7 @@ state are per-thread under Forge. See the Forge section for concurrency semantic
 | `!+n` or `!+@n` | Relative forward by `n` bytes (head += `n x 8`) |
 | `!-n` or `!-@n` | Relative backward by `n` bytes (head -= `n x 8`) |
 
-`!@0` always jumps to the start of the tape. Moving the head before bit 0 is a runtime
-error.
-
-Numeric arguments to jump and selection commands are parsed as unsigned 64-bit integers.
-Literals that would overflow the interpreter's safe limit (9 x 10^18) are rejected at
-parse time with an error.
+`!@0` always jumps to the start of the tape.
 
 ---
 
@@ -83,18 +104,20 @@ parse time with an error.
 | `-` | Clear the current bit to 0 |
 | `=` | Flip (toggle) the current bit |
 
-The flip operation (`=`) is performed atomically under the tape mutex, making it safe
-under Forge concurrency.
+The flip is performed atomically under the tape mutex.
 
 ### Byte literals
 
 | Command | Effect |
 |---------|--------|
-| `!#HH` | Write the byte `0xHH` at the head; advance head by 8 bits |
+| `!#H` or `!#HH` | Write the byte with the given hex value at the head; advance head by 8 bits |
 | `!'C'` | Write the byte for character `C` at the head; advance head by 8 bits |
 | `!"string"` | Write the string bytes at the head; advance head past all written bytes |
 
-String literals (`!"..."`) support the following escape sequences:
+Hex digits may be upper or lower case. `!#` needs at least one hex digit, and takes at most
+two, so `!#F+` is the byte `0x0F` followed by `+`.
+
+String literals (`!"..."`) support these escape sequences:
 
 | Escape | Value |
 |--------|-------|
@@ -104,13 +127,15 @@ String literals (`!"..."`) support the following escape sequences:
 | `\0` | null byte (0x00) |
 | `\\` | backslash |
 | `\"` | double quote |
-| `\xHH` | arbitrary byte with hex value `HH` |
+| `\xH` or `\xHH` | arbitrary byte with the given hex value (one or two digits required) |
 
-Character literals (`!'C'`) support `\n`, `\t`, `\r`, `\0`, and `\\`.
+Any other escaped character stands for itself. An unterminated string is a fatal error.
 
-Writing a byte or string literal writes bits in big-endian order (most significant bit
-first). After a string literal, the head points to the bit immediately after the last
-written byte.
+Character literals (`!'C'`) support `\n`, `\t`, `\r` and `\0`. Any other escaped character
+stands for itself, so `\\` and `\'` work.
+
+Literals write bits in big-endian order (most significant bit first). After a literal, the
+head points to the bit immediately after the last written byte.
 
 ---
 
@@ -125,8 +150,9 @@ A selection is a byte-addressed range consisting of:
 - `end` — end byte index (inclusive)
 - `mark` / `mark_set` — a saved position set by `!M`
 
-Selections are byte-indexed. `end` is inclusive. When a selection is active, I/O commands
-operate on the entire selected range rather than the single byte at the head.
+`end` is inclusive. When a selection is active, I/O commands operate on the entire selected
+range rather than the single byte at the head. A selection stays active until another
+selection replaces it; there is no command to clear it.
 
 ### Selection commands
 
@@ -138,10 +164,12 @@ operate on the entire selected range rather than the single byte at the head.
 | `![n:+m]` | Select `m` bytes starting at byte `n` (i.e. `n..n+m-1`); `m` must be >= 1 |
 | `![M:@]` | Select from the mark to the current head byte; requires a prior `!M` |
 
-`![M:@]` automatically swaps start and end if the head is before the mark, so the
-selection is always ordered. Using `![M:@]` without a prior `!M` is a runtime error.
+If the start is after the end (`![5:2]`, or `![M:@]` with the head before the mark), the two
+are swapped so the selection is always ordered. A selection that would extend past byte
+2^61 − 1 is an error and leaves the current selection unchanged. `![M:@]` without a prior
+`!M`, and `![n:+0]`, are errors that leave the current selection unchanged.
 
-`![n:+0]` (a zero-length relative selection) is a runtime error.
+Commands that read a selection into memory (`!X`, `!$VAR<-`, `!^`) accept at most 256 MiB.
 
 ---
 
@@ -149,36 +177,42 @@ selection is always ordered. Using `![M:@]` without a prior `!M` is a runtime er
 
 ### Output — `!O`
 
-- If a selection is active, `!O` writes all bytes in the selection to the destination.
-- If no selection is active and the destination is stdout, `!O` writes the single byte at
-  the head and advances the head by one byte.
-- If no selection is active and the destination is a file (`!O[path]`), the interpreter
-  writes bytes from the head until a null byte is encountered (legacy v2 behaviour).
+- With an active selection, `!O` writes every byte of the selection.
+- With no selection and no path, `!O` writes the single byte at the head to stdout and
+  advances the head by one byte.
+- With no selection and a path (`!O[path]`), the interpreter writes bytes from the head
+  until a null byte is reached, advancing the head.
+- `!O[path]` **appends** to the file, creating it if needed.
 
 ### Input — `!I`
 
-- If a selection is active, `!I[path]` reads bytes from the source into the selection
-  range, writing up to the selection length.
-- If no selection is active, `!I` reads in stream mode: bytes are written from the head
-  and the head advances with each byte.
+- With an active selection, `!I` reads bytes into the selection range, up to the selection
+  length or end of input. Unread input stays in the source, so a later `!I` continues from
+  where this one stopped.
+- With no selection, `!I` reads to end of input, writing from the head and advancing the
+  head with each byte.
 - Omitting `[path]` reads from stdin.
 
 ### Stderr — `!E`
 
-`!E` writes output to stderr using the same selection semantics as `!O`.
+`!E` writes to stderr: the whole selection if one is active, otherwise the single byte at
+the head, advancing the head by one byte.
 
 ### Execute — `!X`
 
-`!X` requires an active selection. The selection bytes are read as a null-terminated
-string and passed directly to the shell (`/bin/sh -c`). No sanitisation is performed.
-See SECURITY.md for the implications.
+`!X` requires an active selection. The selection bytes, up to the first null byte, are
+passed to the shell (`/bin/sh -c`). No sanitisation is performed. See SECURITY.md. Output
+buffers are flushed before the command runs.
 
 | Form | Behaviour |
 |------|-----------|
-| `!X` | Execute; discard stdout (streams to terminal) |
-| `!X->@n` | Execute; capture stdout into tape starting at byte `n` |
-| `!X->?` | Execute; write exit code as a single byte at the head |
-| `!X->!` | Execute; pipe host stdin through the command |
+| `!X` | Execute; output goes to the terminal |
+| `!X->@n` | Execute; capture stdout into the tape starting at byte `n` |
+| `!X->?` | Execute; write the exit code as a single byte at the head (255 if the command did not exit normally). The head does not move |
+| `!X->!` | Execute with the host's stdin as the command's input (the interpreter reads all of stdin first) |
+
+`->` directly after `!X` is always read as part of the form. Capture stops, with an error,
+if it reaches the end of the addressable tape.
 
 ---
 
@@ -187,19 +221,25 @@ See SECURITY.md for the implications.
 ### Load — `!L[path]`
 
 Reads raw file bytes onto the tape at the head in stream mode (head advances with each
-byte). File loads are capped at 256 MiB. Loads exceeding this limit are aborted with an
-error.
+byte). Loads are capped at 256 MiB per call; a larger file stops with an error after the
+first 256 MiB have been written.
 
 ### Write — `!W[path]`
 
-Writes the current selection to the file at `path`. Requires an active selection.
+Writes the current selection to the file at `path`, replacing its contents. Requires an
+active selection.
 
 ### File jumps — `%//path`
 
-Hands off execution to another `.bitlang` script. File jumps are state handoffs, not
-subroutine calls — the target script shares the tape but gets its own token stream. The
-interpreter enforces the `.bitlang` extension. The current head position is carried into
-the target script and propagated back on return.
+Runs another `.bitlang` script to completion, then continues after the jump.
+
+- The path is everything after `%//` up to the next `%` or newline, with surrounding
+  whitespace trimmed. It must end in `.bitlang`. Relative paths use the working directory.
+- The target shares the tape, head, selection and mark with the caller. Head changes made
+  by the target are visible after the jump.
+- Inside the target, `!~` refers to the target's own file.
+- File jumps and `!^` share a nesting limit of 64 levels. Exceeding it prints an error and
+  skips that jump.
 
 ---
 
@@ -207,11 +247,11 @@ the target script and propagated back on return.
 
 | Command | Effect |
 |---------|--------|
-| `!$VAR` | Read env var `VAR`; write its string value to the tape at the head |
-| `!$VAR<-[n:m]` | Write the tape selection `[n:m]` into env var `VAR` |
+| `!$VAR` | Read env var `VAR`; write its string value to the tape at the head (no null terminator is written). Nothing happens if the variable is unset |
+| `!$VAR<-[n:m]` | Set env var `VAR` to the bytes of selection `[n:m]`, up to the first null byte |
+| `!$VAR<-` | The same, using the active selection |
 
-Variable names may contain alphanumeric characters and underscores only. See SECURITY.md
-for the implications of environment variable access.
+Variable names may contain alphanumeric characters and underscores only.
 
 ---
 
@@ -220,61 +260,49 @@ for the implications of environment variable access.
 ### Self-load — `!~`
 
 Loads the current script file onto the tape at the head (same semantics as `!L`). The
-script path must be known (i.e. the interpreter was invoked with a file argument).
+script path must be known.
 
-### Eval — `!^[n:m]`
+### Eval — `!^[n:m]` and `!^`
 
-Reads the tape region `[n:m]` as a string of BitLang source code and evaluates it. All
-selection forms supported by `![...]` are valid here. The head and selection state are
-shared with the calling context; head changes made inside the eval are propagated back.
+Reads a tape region as BitLang source (up to the first null byte) and runs it as a complete
+program: every `%`-separated line runs, and `!%!` ends it. All selection forms valid in
+`![...]` are accepted. With no brackets, `!^` uses the active selection, and it is an error
+if there is none.
 
-Eval calls are limited to 64 levels of nesting. Exceeding this limit prints an error and
-returns without executing the inner eval. This prevents stack exhaustion from recursive
-`!^` chains.
-
-Because `!^` combined with `!X` or `!$VAR` enables construction and execution of arbitrary
-code at runtime, scripts using eval should be treated with the same caution as shell
-scripts. See SECURITY.md.
+The eval shares the tape, head and selection with the caller. A lexer error in the
+evaluated text is fatal for the whole interpreter. Eval and file jumps share the 64-level
+nesting limit.
 
 ---
 
-## Control Flow and Blocks
+## Control Flow
 
-### Comments
+### Conditional — `!!{ condition }! body`
 
-Lines beginning with `#` are comments and are ignored by the lexer.
+`!!` is followed by a block in braces. The interpreter runs the block, then reads the bit
+at the head (wherever the block left it), then restores the head to where it was before the
+block. If the bit was 1, `body` runs. If it was 0, `body` is skipped.
 
-### Line and program terminators
+`body` extends to the end of the line (`%`, `%%`, or the closer of the enclosing loop or
+Forge block).
 
-| Token | Meaning |
-|-------|---------|
-| `%` | Line end |
-| `%%` | Block end |
-| `!%!` | Program end; stops execution |
-
-### Conditional — `!!{ condition }{ body }`
-
-The `!!` token opens a conditional. The interpreter evaluates `condition` (a block of
-commands), then reads the current bit. If the bit is 1, `body` is executed. If 0, the
-body is skipped. The head is restored to its position before the condition after the
-condition block completes.
+The `}` of the block consumes one following `!` if present, so write a space before any
+command that starts with `!`: `}! !>` is a byte move, while `}!>` is a bit move.
 
 ### While loop — `[ body ]`
 
-The interpreter executes `body` repeatedly while the current bit is 1. If the bit is 0
-on entry, the body is never executed. The condition is re-evaluated (by reading the current
-bit) after each iteration.
+Runs `body` while the bit at the head is 1. If the bit is 0 on entry, the body is skipped.
+The bit is re-read after each iteration.
 
 ### Counted loop — `!n[ body ]`
 
-Executes `body` exactly `n` times. `n` is a decimal integer literal. `!0[...]` executes
-the body zero times. Nested counted loops are supported.
+Runs `body` exactly `n` times. `!0[ ... ]` runs it zero times. Loops can be nested.
 
 ```
 !3[ A B C ]
 ```
 
-is exactly equivalent to:
+is equivalent to:
 
 ```
 A B C
@@ -282,38 +310,57 @@ A B C
 A B C
 ```
 
-### Forge blocks — `$ line1 | line2 | line3 $!`
+A loop must open and close on the same line. A `%` inside a loop body is an error.
 
-Forge runs each `|`-separated segment concurrently in its own thread. All threads share
-the tape (mutex-protected); each thread has its own head and selection state initialised
-to a copy of the calling context's state at the point the Forge block is entered. The
-calling thread waits for all Forge threads to complete before continuing.
+### Forge — `$ line1 | line2 | line3 $!`
 
-Forge blocks support up to 64 segments. Segments beyond this limit are silently ignored.
+Each `|`-separated segment runs concurrently in its own thread. All threads share the tape.
+Each thread gets its own head and selection, copied from the calling context when the block
+starts. The caller waits for all threads, then continues with its own head and selection
+unchanged.
+
+A Forge block may have up to 64 segments; more is a fatal error. If the system cannot
+start a thread, that segment runs in the calling thread with a warning.
+
+Single-bit and single-byte tape operations are atomic. Multi-byte operations (strings,
+selection I/O, `!L`) are not atomic as a whole, so segments writing to overlapping regions
+can interleave. Output order between segments is not defined.
 
 ---
 
 ## Error Conditions
 
-The following conditions produce a diagnostic message on stderr and terminate the
-interpreter (or abort the current operation):
+Fatal errors print a message on stderr and end the interpreter with exit status 1.
 
-| Condition | Where detected |
-|-----------|----------------|
+| Fatal condition | Detected in |
+|-----------------|-------------|
 | Bare `!` at end of source | Lexer |
-| Unknown `!x` sequence | Lexer |
-| Unexpected character | Lexer |
-| Expected number, none found | Lexer |
-| Numeric literal overflow | Lexer |
-| `![M:@]` used without prior `!M` | Executor |
-| `![n:+0]` zero-length relative selection | Executor |
-| Head moved before bit 0 | Executor |
-| `!X` without active selection | Executor |
-| `!W` without active selection | Executor |
-| `!L` file exceeds 256 MiB | Executor |
-| `!^` recursion depth exceeded (> 64) | Executor |
-| `%//` with empty or non-`.bitlang` path | Executor |
-| Allocation failure (OOM) | Any |
+| Unknown `!x` sequence, unexpected character | Lexer |
+| Expected number, none found; numeric literal above 2^61 − 1 | Lexer |
+| Unterminated string literal; `\x` or `!#` with no hex digit | Lexer |
+| Unterminated `[` in a path argument | Lexer |
+| Unreadable script file, or script above 256 MiB | Loader |
+| Head moved before bit 0 or past the end of the tape | Executor |
+| `!!` not followed by `{`, or missing `}!` | Executor |
+| Loop not closed with `]` on the same line; `!n` not followed by `[` | Executor |
+| Unmatched `]`, `}`, `\|` or `$!` | Executor |
+| `%//` with an empty or non-`.bitlang` path, or an unreadable target | Executor |
+| More than 64 Forge segments | Executor |
+| Allocation failure | Any |
+
+Non-fatal errors print a message and skip that one operation; execution continues.
+
+| Non-fatal condition |
+|---------------------|
+| `![M:@]` without a prior `!M`; `![n:+0]`; selection past the end of the tape |
+| `!X`, `!W`, or `!^` / `!$VAR<-` without a selection |
+| Selection over 256 MiB passed to `!X`, `!$VAR<-` or `!^` |
+| `!L` or `!W` with no path; any file that cannot be opened by `!L`, `!W`, `!I`, `!O` |
+| `!L` file exceeds 256 MiB (the first 256 MiB are kept) |
+| `!^` or `%//` nesting limit (64) reached |
+| `!X` capture reaches the end of the tape |
+| `popen`, `mkstemp` or `setenv` failure |
+| `!~` when the script path is unknown |
 
 ---
 
@@ -324,11 +371,11 @@ interpreter (or abort the current operation):
 ```
 !"Hello"
 !@0
-!O !4[ !> !O ]
+!5[ !O ]
 ```
 
-Writes `Hello` to the tape starting at byte 0, jumps back to byte 0, outputs the first
-byte, then repeats `!> !O` four times to step through and output the remaining four bytes.
+Writes `Hello` at byte 0, jumps back to byte 0, then runs `!O` five times. Each `!O` with no
+selection outputs the byte at the head and moves the head one byte right.
 
 ### Write and output a string using a selection
 
@@ -338,23 +385,30 @@ byte, then repeats `!> !O` four times to step through and output the remaining f
 !O
 ```
 
-Writes `Hello`, sets a selection over bytes 0 to 4 inclusive, then outputs the entire
-selection in one `!O` call.
+Writes `Hello`, selects bytes 0 to 4 inclusive, and outputs the whole selection.
 
-### Flip a bit conditionally
+### Flip a bit in a loop
 
 ```
 !#01
-<<<<<<<<
-[
-    =
-]
+<
+[ = ]
 !@0
 !O
 ```
 
-Writes byte `0x01`, moves the head back to bit 0, then loops while the current bit is 1,
-flipping it each iteration. After the loop the bit is 0. Outputs the result byte (`0x00`).
+After `!#01` the head is at bit 8. `<` moves it to bit 7, the lowest bit of byte 0, which is
+1. The loop flips it to 0 and stops. The output is the byte `0x00`.
+
+### Conditional
+
+```
++ !!{ }! !#41
+![0:0] !O
+```
+
+The condition block is empty, so the bit at the head (just set by `+`) decides. It is 1, so
+`!#41` runs and the output is `A`.
 
 ### Execute a shell command from the tape
 
@@ -364,17 +418,19 @@ flipping it each iteration. After the loop the bit is 0. Outputs the result byte
 !X
 ```
 
-Writes the string `echo hello`, selects bytes 0 to 9, and executes it via the shell.
+Writes `echo hello`, selects bytes 0 to 9, and runs it. Prints `hello`.
 
 ### Capture shell output into the tape
 
 ```
-!"date"
-![0:3]
+!"echo hi"
+![0:6]
 !X->@10
+![10:12]
+!O
 ```
 
-Runs `date` and captures its stdout into the tape starting at byte 10.
+Runs `echo hi`, captures its output (`hi` and a newline) at byte 10, then outputs it.
 
 ### Parallel Forge execution
 
@@ -382,22 +438,89 @@ Runs `date` and captures its stdout into the tape starting at byte 10.
 $
 !"A" ![0:0] !O
 |
-!"B" ![0:0] !O
+!@8 !"B" ![8:8] !O
 $!
 ```
 
-Runs both segments concurrently. Each thread has its own head and selection. Output order
-is non-deterministic.
+Runs both segments concurrently, each with its own head. The segments write to different
+bytes, so the tape ends up the same every time; the order of the two output characters is
+not defined.
+
+### Eval
+
+```
+!"!'Z'" ![0:3]
+!@30
+!^
+![30:30] !O
+```
+
+Writes the source `!'Z'`, selects it, moves to byte 30, and evaluates the selection. The
+evaluated code writes `Z` at the head, and the script outputs it.
+
+### File jump
+
+`helper.bitlang`:
+
+```
+!"X" ![0:0] %
+```
+
+`main.bitlang`:
+
+```
+%// helper.bitlang
+!O %
+```
+
+The helper writes `X` and selects byte 0. Back in `main`, the selection is still active and
+`!O` outputs `X`.
 
 ---
 
-## Implementation Limits (v3 reference interpreter)
+## Implementation Limits (v4 reference interpreter)
 
 | Limit | Value |
 |-------|-------|
-| Max `!^` recursion depth | 64 |
-| Max `!L` file size | 256 MiB |
-| Max Forge segments per block | 64 (excess silently ignored) |
-| Max numeric literal | 9 x 10^18 |
+| Max numeric literal and byte index | 2^61 − 1 (2305843009213693951) |
+| Max head position | bit 2^64 − 8 |
+| Max `!^` and `%//` nesting depth (shared) | 64 |
+| Max `!L` size per call | 256 MiB |
+| Max selection read into memory (`!X`, `!$VAR<-`, `!^`) | 256 MiB |
+| Max script file size | 256 MiB |
+| Max Forge segments per block | 64 (more is an error) |
 | Tape chunk size | 4096 bits (512 bytes) |
 | Tape chunk map buckets | 4096 |
+
+---
+
+## Changes from v3
+
+**Behaviour changes**
+
+- `%//` and `!^` run every line of the target, not only the first.
+- `!^` and `!$VAR<-` with no brackets use the active selection (v3 used byte 0).
+- `!^[n]`, `!^[n:+m]` and `![M:@]` are honoured by `!^` (v3 read the numbers as a plain
+  range).
+- Reversed ranges are swapped. In v3 they gave inconsistent results across commands.
+- The numeric limit dropped from 9 x 10^18 to 2^61 − 1, because larger byte indices wrapped
+  around when converted to bit addresses.
+- `!#` accepts one or two hex digits and rejects none; `\x` follows the same rule.
+- Unterminated strings, unterminated `[path`, and more than 64 Forge segments are errors.
+- A stray `]`, `}`, `|` or `$!` at the top level is an error.
+
+**Bug fixes**
+
+- Endless loop on stray closers.
+- `!I` into a full selection lost one input byte.
+- `!#F` swallowed the next character; `\x4"` swallowed the closing quote.
+- Recursive `%//` crashed with a stack overflow.
+- A failed thread start led to joining a thread that never ran.
+- Reads of unwritten tape allocated memory.
+
+**Internal changes**
+
+- One lock acquisition per byte instead of one per bit, so byte writes are atomic and
+  loads are much faster.
+- Script files are read in a loop, so pipes work, and are size-limited.
+- Output is flushed before shell commands run.
